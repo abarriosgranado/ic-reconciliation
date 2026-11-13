@@ -1,0 +1,16 @@
+const fs=require('node:fs');
+const vm=require('node:vm');
+const assert=require('node:assert/strict');
+const html=fs.readFileSync('docs/index.html','utf8');
+const context=vm.createContext({TextEncoder,Uint8Array,DataView,Intl});
+vm.runInContext(html.split('<script>')[1].split('</script>')[0].replace('action(refresh);',''),context);
+const state=JSON.parse(fs.readFileSync('docs/state.json','utf8'));
+const record=state.history.at(-1);
+const data=JSON.parse(record.data);
+const workbook=context.excelWorkbook(data,record.created);
+assert.equal(workbook[0],0x50);
+assert.equal(workbook[1],0x4b);
+assert.ok(html.includes('Download Excel'));
+assert.ok(!html.includes('JSON details'));
+if(process.argv[2])fs.writeFileSync(process.argv[2],workbook);
+console.log('PASS: Excel download generates an XLSX archive');
