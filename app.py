@@ -18,7 +18,7 @@ CATEGORIES = ['Balance', 'P&L', 'Patrimonio']
 def conversion_methods(payload):
     methods = payload.get('methods', {category: payload.get('method', 'Closing') for category in CATEGORIES})
     if not isinstance(methods, dict) or set(methods) != set(CATEGORIES) or any(value not in ['Closing', 'Average', 'Historical'] for value in methods.values()):
-        raise ValueError('Selecciona un método válido para Balance, P&L y Patrimonio')
+        raise ValueError('Select a valid method for Balance Sheet, P&L and Equity')
     return methods
 
 def connect():
@@ -50,38 +50,38 @@ def validate_settings(payload):
     base = str(payload.get('base', '')).strip().upper()
     currencies = list(dict.fromkeys(str(value).strip().upper() for value in payload.get('currencies', [])))
     if mode not in ['One Currency', 'Multi Currency']:
-        raise ValueError('Selecciona One Currency o Multi Currency')
+        raise ValueError('Select One Currency or Multi Currency')
     if not currencies or any(len(value) != 3 or not value.isascii() or not value.isalpha() for value in currencies):
-        raise ValueError('Introduce códigos de moneda de tres letras, por ejemplo EUR, USD')
+        raise ValueError('Enter three-letter currency codes, such as EUR or USD')
     if base not in currencies:
-        raise ValueError('La moneda base debe estar entre las monedas seleccionadas')
+        raise ValueError('The base currency must be one of the selected currencies')
     if mode == 'One Currency' and len(currencies) != 1:
-        raise ValueError('One Currency requiere una sola moneda')
+        raise ValueError('One Currency requires exactly one currency')
     if mode == 'Multi Currency' and len(currencies) < 2:
-        raise ValueError('Multi Currency requiere al menos dos monedas')
+        raise ValueError('Multi Currency requires at least two currencies')
     method = payload.get('method', 'Closing')
     if method not in ['Closing', 'Average', 'Historical']:
-        raise ValueError('Método de conversión no válido')
+        raise ValueError('Invalid conversion method')
     tolerance = amount(payload.get('tolerance', '0.01'))
     if tolerance < 0:
-        raise ValueError('La tolerancia no puede ser negativa')
+        raise ValueError('Tolerance cannot be negative')
     return dict(mode=mode, base=base, currencies=currencies, methods=conversion_methods(payload), tolerance=str(tolerance))
 
 def amount(value):
     result = Decimal(str(value))
     if not result.is_finite():
-        raise ValueError('Importe o tipo de cambio no válido')
+        raise ValueError('Invalid amount or exchange rate')
     return result
 
 def reconcile(rows, options):
     tolerance = amount(options.get('tolerance', '0.01'))
     if tolerance < 0:
-        raise ValueError('La tolerancia debe ser positiva')
+        raise ValueError('Tolerance must be non-negative')
     mode = options.get('mode', 'One Currency')
     method = options.get('method', 'Closing')
     matching = options.get('matching', 'Balances')
     if mode not in ['One Currency', 'Multi Currency'] or method not in ['Closing', 'Average', 'Historical'] or matching not in ['Balances', 'Movements']:
-        raise ValueError('Configuración no válida')
+        raise ValueError('Invalid settings')
     base = options.get('base', 'EUR').upper()
     rates = options.get('rates', {})
     groups = {}
@@ -89,29 +89,29 @@ def reconcile(rows, options):
     for row in rows:
         category = row.get('category') or row['statement']
         if category not in CATEGORIES:
-            raise ValueError('Categoría contable desconocida: ' + category)
+            raise ValueError('Unknown accounting category: ' + category)
         method = methods[category]
         entity, counterparty = row['entity'], row['counterparty']
         if entity == counterparty:
-            raise ValueError('Una entidad no puede ser su propia contraparte')
+            raise ValueError('An entity cannot be its own counterparty')
         value = amount(row['amount'])
         currency = row['currency'].upper()
         if options.get('currencies') and currency not in options['currencies']:
-            raise ValueError('Moneda no configurada en Settings: ' + currency)
+            raise ValueError('Currency not configured in Settings: ' + currency)
         if currency != base:
             if mode == 'One Currency':
-                raise ValueError('One Currency exige todos los registros en la divisa base')
+                raise ValueError('One Currency requires all records in the base currency')
             rate_key = '|'.join([currency, row['date'] if method == 'Historical' else row['period'], method])
             if rate_key not in rates:
-                raise ValueError('Falta tipo de cambio: ' + rate_key)
+                raise ValueError('Missing exchange rate: ' + rate_key)
             rate = amount(rates[rate_key])
             if rate <= 0:
-                raise ValueError('El tipo de cambio debe ser mayor que cero')
+                raise ValueError('Exchange rates must be greater than zero')
             value *= rate
         pair = sorted([entity, counterparty])
         reference = row.get('reference', '') if matching == 'Movements' else ''
         if matching == 'Movements' and not reference:
-            raise ValueError('Los movimientos necesitan referencia')
+            raise ValueError('Movements require a reference')
         key = tuple(pair + [row['period'], row['account'], row['statement'], reference, category])
         group = groups.setdefault(key, {'left': [], 'right': [], 'left_total': Decimal(0), 'right_total': Decimal(0)})
         side = 'left' if entity == pair[0] else 'right'
@@ -127,24 +127,25 @@ def reconcile(rows, options):
 def ingest(payload, mapping):
     company = str(payload.get('company', '')).strip()
     if not company:
-        raise ValueError('Selecciona una empresa del listado')
+        raise ValueError('Select a company from the list')
     rows = list(csv.DictReader(io.StringIO(payload['csv'].lstrip('\ufeff'))))
     if not rows:
-        raise ValueError('El archivo no contiene registros')
+        raise ValueError('The file contains no records')
     normalized = []
     for index, source in enumerate(rows, 2):
         row = {field: str(source.get(mapping.get(field, field), '') or '').strip() for field in FIELDS}
         if row['entity'] and row['entity'] != company:
-            raise ValueError('Fila %s: la empresa del archivo no coincide con la seleccionada (%s)' % (index, company))
+            raise ValueError('Row %s: the file company does not match the selected company (%s)' % (index, company))
         row['entity'] = company
         for field in FIELDS[:6]:
             if not row[field]:
-                raise ValueError('Fila %s: falta %s' % (index, field))
+                raise ValueError('Row %s: missing %s' % (index, field))
         amount(row['amount'])
         row['statement'] = payload['mapping'].split('/')[1]
         row['category'] = str(source.get(mapping.get('category', 'category'), '') or '').strip() or row['statement']
+        row['category'] = {'Equity': 'Patrimonio', 'Balance Sheet': 'Balance'}.get(row['category'], row['category'])
         if row['category'] not in CATEGORIES or (row['statement'] == 'P&L' and row['category'] != 'P&L') or (row['statement'] == 'Balance' and row['category'] == 'P&L'):
-            raise ValueError('Fila %s: categoría incompatible con el estado' % index)
+            raise ValueError('Row %s: category is incompatible with the statement' % index)
         normalized.append(row)
     return normalized
 
@@ -167,38 +168,38 @@ class Handler(BaseHTTPRequestHandler):
                 state['settings'] = json.loads(connection.execute('SELECT data FROM settings WHERE id=1').fetchone()[0])
                 state['demo'] = DEMO
             return self.reply(state)
-        self.reply({'error': 'No encontrado'}, 404)
+        self.reply({'error': 'Not found'}, 404)
 
     def do_POST(self):
         try:
             if self.headers.get('Origin') and self.headers['Origin'] != 'http://' + self.headers.get('Host', ''):
-                return self.reply({'error': 'Origen no permitido'}, 403)
+                return self.reply({'error': 'Origin not allowed'}, 403)
             length = int(self.headers.get('Content-Length', 0))
             if length > 20000000:
-                raise ValueError('Archivo demasiado grande (máximo 20 MB)')
+                raise ValueError('File too large (maximum 20 MB)')
             payload = json.loads(self.rfile.read(length))
             with connect() as connection:
                 if self.path == '/api/company':
                     name = str(payload.get('name', '')).strip()
                     if not name or len(name) > 200:
-                        raise ValueError('Introduce un nombre de empresa de 1 a 200 caracteres')
+                        raise ValueError('Enter a company name between 1 and 200 characters')
                     if connection.execute('SELECT 1 FROM companies WHERE name=?', (name,)).fetchone():
-                        raise ValueError('Esta empresa ya existe en el listado')
+                        raise ValueError('This company already exists')
                     connection.execute('INSERT INTO companies VALUES (?,?)', (str(uuid.uuid4()), name))
                 elif self.path == '/api/settings':
                     settings = validate_settings(payload)
                     connection.execute('UPDATE settings SET data=? WHERE id=1', (json.dumps(settings),))
                 elif self.path == '/api/mapping':
                     if not connection.execute('SELECT 1 FROM mappings WHERE name=?', (payload['name'],)).fetchone():
-                        raise ValueError('Mapeo desconocido')
+                        raise ValueError('Unknown mapping')
                     connection.execute('UPDATE mappings SET data=? WHERE name=?', (json.dumps(payload['data']), payload['name']))
                 elif self.path == '/api/import':
                     record = connection.execute('SELECT data FROM mappings WHERE name=?', (payload['mapping'],)).fetchone()
                     if not record:
-                        raise ValueError('Mapeo desconocido')
+                        raise ValueError('Unknown mapping')
                     company = connection.execute('SELECT * FROM companies WHERE id=?', (payload.get('company_id', ''),)).fetchone()
                     if not company:
-                        raise ValueError('Selecciona una empresa configurada en Settings')
+                        raise ValueError('Select a company configured in Settings')
                     rows = ingest(dict(payload, company=company['name']), json.loads(record[0]))
                     connection.execute('INSERT INTO imports (id,name,created,data,company_id) VALUES (?,?,?,?,?)', (str(uuid.uuid4()), payload['name'], datetime.now().isoformat(), json.dumps(rows), company['id']))
                 elif self.path == '/api/reconcile':
@@ -208,14 +209,14 @@ class Handler(BaseHTTPRequestHandler):
                         if record['id'] in selected:
                             rows.extend(json.loads(record['data']))
                     if not rows:
-                        raise ValueError('Selecciona al menos una importación')
+                        raise ValueError('Select at least one import')
                     settings = json.loads(connection.execute('SELECT data FROM settings WHERE id=1').fetchone()[0])
                     options = dict(payload['options'], **settings)
                     options['matching'] = 'Balances'
                     result = reconcile(rows, options)
                     connection.execute('INSERT INTO history VALUES (?,?,?)', (str(uuid.uuid4()), datetime.now().isoformat(), json.dumps(result)))
                 else:
-                    return self.reply({'error': 'No encontrado'}, 404)
+                    return self.reply({'error': 'Not found'}, 404)
             self.reply({'ok': True})
         except (ValueError, KeyError, TypeError, InvalidOperation) as error:
             self.reply({'error': str(error)}, 400)
