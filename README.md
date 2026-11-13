@@ -2,6 +2,14 @@
 
 Aplicación local de conciliación intercompany con Python y SQLite.
 
+## Versión web
+
+https://abarriosgranado.github.io/ic-reconciliation/
+
+La versión pública es de consulta y utiliza datos ficticios generados desde cero. Permite navegar por resultados y descargar el histórico. No permite importar ni modificar registros. La aplicación Python local conserva las funciones de edición.
+
+Para actualizar la publicación: `python3 build_public.py`. GitHub Pages sirve la carpeta `docs` de la rama `main`.
+
 ## Ejecutar
 
 Requiere Python 3.9 o superior. No necesita dependencias externas.
