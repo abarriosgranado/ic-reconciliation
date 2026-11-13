@@ -1,0 +1,36 @@
+const fs=require('node:fs');
+const vm=require('node:vm');
+const assert=require('node:assert/strict');
+const {webcrypto}=require('node:crypto');
+const seed=JSON.parse(fs.readFileSync('docs/state.json','utf8'));
+let stored=null;
+const context=vm.createContext({structuredClone,crypto:webcrypto,localStorage:{getItem:()=>stored,setItem:(key,value)=>stored=value},fetch:async()=>({ok:true,json:async()=>structuredClone(seed)})});
+vm.runInContext(fs.readFileSync('browser_store.js','utf8'),context);
+async function run(){
+ const api=context.api;
+ const initial=await api('state');
+ const company=initial.companies[0];
+ await api('import',{company_id:company.id,mapping:'NetSuite/Balance',name:'test.csv',csv:'counterparty,account,period,currency,amount,reference\nOther,IC,2026-11,EUR,100.10,INV-1'});
+ let state=await api('state');
+ assert.equal(state.imports.length,initial.imports.length+1);
+ const imported=state.imports.at(-1);
+ assert.equal(JSON.parse(imported.data)[0].entity,company.name);
+ await assert.rejects(()=>api('import',{company_id:company.id,mapping:'NetSuite/Balance',name:'bad.csv',csv:'counterparty,account,period,currency,amount\nOther,IC,2026-11,EUR,NaN'}));
+ state=await api('state');assert.equal(state.imports.length,initial.imports.length+1);
+ await api('reconcile',{imports:[imported.id],options:{rates:{}}});
+ state=await api('state');
+ const run=JSON.parse(state.history.at(-1).data);
+ assert.equal(run.results[0].difference,'100.10000000');
+ assert.equal(run.results[0].status,'Exception');
+ assert.ok(stored.includes('test.csv'));
+ const rows=context.csvRows('name;amount\r\n"Quoted; company";12.5');
+ assert.equal(rows[0].name,'Quoted; company');
+ const sample={entity:'A',counterparty:'B',account:'IC',period:'2026-11',date:'2026-11-01',currency:'EUR',amount:'0.1',statement:'Balance'};
+ const result=context.browserReconcile([sample,{...sample,amount:'0.2'},{...sample,entity:'B',counterparty:'A',amount:'-0.3'}],{...initial.settings,tolerance:'0',rates:{}});
+ assert.equal(result.results[0].status,'Matched');
+ const reload=vm.createContext({structuredClone,crypto:webcrypto,localStorage:{getItem:()=>stored},fetch:()=>{throw Error('Unexpected fetch');}});
+ vm.runInContext(fs.readFileSync('browser_store.js','utf8'),reload);
+ assert.equal((await reload.api('state')).imports.at(-1).name,'test.csv');
+ console.log('PASS: CSV, validation, persistence, reload, reconciliation and decimal precision');
+}
+run().catch(error=>{console.error(error);process.exitCode=1;});

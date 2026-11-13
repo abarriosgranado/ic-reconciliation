@@ -32,12 +32,105 @@ h2{font-size:30px;letter-spacing:-1px;margin:8px 0 12px}h3{font-size:17px;letter
 let state,tab='Dashboard',selectedHistory=null;
 const tabs=['Dashboard','Imports','Exceptions','History','Mappings'];
 const escapeHTML=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
-async function api(path,data){
- if(data||path!=='state')throw Error('Esta versión pública es de consulta.');
- const response=await fetch('./state.json');
- if(!response.ok)throw Error('No se han podido cargar los datos. Recarga la página.');
- return response.json();
+const storageKey='ic-reconciliation-workspace-v1';
+let browserState;
+function decimal(value){
+ const text=String(value).trim();
+ if(!/^[+-]?\d+(\.\d{1,8})?$/.test(text))throw Error('Importe o tipo no válido: '+text+' (máximo 8 decimales)');
+ const negative=text.startsWith('-'),parts=text.replace(/^[+-]/,'').split('.');
+ return (negative?-1n:1n)*(BigInt(parts[0])*100000000n+BigInt((parts[1]||'').padEnd(8,'0')));
 }
+function decimalText(value){const negative=value<0n;const absolute=negative?-value:value;return (negative?'-':'')+(absolute/100000000n).toString()+'.'+(absolute%100000000n).toString().padStart(8,'0');}
+function csvRows(text){
+ text=text.replace(/^\uFEFF/,'');
+ const first=text.split(/\r?\n/)[0],separator=first.includes(';')?';':',';
+ const rows=[];let row=[],field='',quoted=false;
+ for(let index=0;index<text.length;index++){
+  const character=text[index];
+  if(character==='"'){
+   if(quoted&&text[index+1]==='"'){field+='"';index++;}else quoted=!quoted;
+  }else if(character===separator&&!quoted){row.push(field);field='';}
+  else if((character==='\n'||character==='\r')&&!quoted){if(character==='\r'&&text[index+1]==='\n')index++;row.push(field);if(row.some(value=>value.trim()))rows.push(row);row=[];field='';}
+  else field+=character;
+ }
+ if(quoted)throw Error('CSV con comillas sin cerrar');
+ row.push(field);if(row.some(value=>value.trim()))rows.push(row);
+ if(rows.length<2)throw Error('El archivo no contiene registros');
+ const headers=rows.shift().map(value=>value.trim());
+ if(new Set(headers).size!==headers.length)throw Error('Hay columnas duplicadas');
+ return rows.map((values,index)=>{if(values.length!==headers.length)throw Error('Número de columnas incorrecto en fila '+(index+2));return Object.fromEntries(headers.map((header,column)=>[header,values[column].trim()]));});
+}
+function importRows(payload,workspace){
+ const company=workspace.companies.find(item=>item.id===payload.company_id);
+ const mappingRecord=workspace.mappings.find(item=>item.name===payload.mapping);
+ if(!company||!mappingRecord)throw Error('Selecciona empresa y mapeo');
+ const mapping=JSON.parse(mappingRecord.data),statement=payload.mapping.split('/')[1];
+ return csvRows(payload.csv).map((source,index)=>{
+  const row=Object.fromEntries(['entity','counterparty','account','period','currency','amount','reference','date','category'].map(field=>[field,source[mapping[field]||field]||'']));
+  if(row.entity&&row.entity!==company.name)throw Error('Fila '+(index+2)+': empresa distinta de la seleccionada');
+  row.entity=company.name;row.statement=statement;row.category=row.category||statement;
+  for(const field of ['counterparty','account','period','currency','amount'])if(!row[field])throw Error('Fila '+(index+2)+': falta '+field);
+  if(!['Balance','P&L','Patrimonio'].includes(row.category)||(statement==='P&L'&&row.category!=='P&L')||(statement==='Balance'&&row.category==='P&L'))throw Error('Categoría incompatible con el estado');
+  decimal(row.amount);row.currency=row.currency.toUpperCase();return row;
+ });
+}
+function browserReconcile(rows,options){
+ const groups=new Map(),tolerance=decimal(options.tolerance);
+ if(tolerance<0n)throw Error('Tolerancia negativa');
+ for(const entry of rows){
+  const row={...entry},category=row.category||row.statement,method=options.methods[category];
+  if(row.entity===row.counterparty)throw Error('Una empresa no puede ser su contraparte');
+  if(!options.currencies.includes(row.currency))throw Error('Moneda no configurada: '+row.currency);
+  let value=decimal(row.amount);
+  if(row.currency!==options.base){
+   if(options.mode==='One Currency')throw Error('La moneda debe coincidir con la moneda base');
+   const key=[row.currency,method==='Historical'?row.date:row.period,method].join('|');
+   if(!options.rates||options.rates[key]===undefined)throw Error('Falta tipo de cambio: '+key);
+   const rate=decimal(options.rates[key]);if(rate<=0n)throw Error('Tipo de cambio no válido');
+   value=value*rate/100000000n;
+  }
+  const pair=[row.entity,row.counterparty].sort(),key=JSON.stringify([pair,row.period,row.account,row.statement,category]);
+  if(!groups.has(key))groups.set(key,{pair,period:row.period,account:row.account,statement:row.statement,category,reference:'',left:[],right:[],left_total:0n,right_total:0n});
+  const group=groups.get(key),side=row.entity===pair[0]?'left':'right';
+  group[side].push({...row,converted:decimalText(value),conversion_method:row.currency!==options.base?method:null});group[side+'_total']+=value;
+ }
+ const results=[...groups.values()].map(group=>{const difference=group.left_total+group.right_total;return {...group,status:group.left.length&&group.right.length&&(difference<0n?-difference:difference)<=tolerance?'Matched':'Exception',difference:decimalText(difference),left_total:decimalText(group.left_total),right_total:decimalText(group.right_total)};});
+ return {options,rows:rows.length,results};
+}
+async function api(path,payload){
+ if(!browserState){
+  const saved=localStorage.getItem(storageKey);
+  if(saved)browserState=JSON.parse(saved);
+  else{const response=await fetch('./state.json');if(!response.ok)throw Error('No se han podido cargar los datos');browserState=await response.json();}
+ }
+ if(path==='state'&&!payload)return structuredClone(browserState);
+ const workspace=structuredClone(browserState),created=new Date().toISOString(),id=crypto.randomUUID();
+ if(path==='import'){
+  const rows=importRows(payload,workspace);
+  workspace.imports.push({id,name:payload.name,created,company_id:payload.company_id,data:JSON.stringify(rows)});
+ }else if(path==='company'){
+  const name=String(payload.name||'').trim();if(!name||name.length>200)throw Error('Nombre de empresa no válido');
+  if(workspace.companies.some(item=>item.name.toLowerCase()===name.toLowerCase()))throw Error('La empresa ya existe');
+  workspace.companies.push({id,name});
+ }else if(path==='mapping'){
+  const mapping=workspace.mappings.find(item=>item.name===payload.name);if(!mapping)throw Error('Mapeo desconocido');
+  if(!payload.data||typeof payload.data!=='object'||Array.isArray(payload.data)||Object.values(payload.data).some(value=>typeof value!=='string'))throw Error('Mapeo de columnas no válido');
+  mapping.data=JSON.stringify(payload.data);
+ }else if(path==='settings'){
+  const settings=payload;
+  if(!['One Currency','Multi Currency'].includes(settings.mode)||!settings.currencies.includes(settings.base)||settings.currencies.some(value=>!(/^[A-Z]{3}$/).test(value))||(settings.mode==='One Currency'?settings.currencies.length!==1:settings.currencies.length<2)||decimal(settings.tolerance)<0n)throw Error('Configuración de monedas no válida');
+  if(['Balance','P&L','Patrimonio'].some(category=>!['Closing','Average','Historical'].includes(settings.methods[category])))throw Error('Métodos no válidos');
+  workspace.settings=settings;
+ }else if(path==='reconcile'){
+  const rows=workspace.imports.filter(item=>payload.imports.includes(item.id)).flatMap(item=>JSON.parse(item.data));
+  if(!rows.length)throw Error('Selecciona al menos una importación');
+  const result=browserReconcile(rows,{...payload.options,...workspace.settings,matching:'Balances'});
+  workspace.history.push({id,created,data:JSON.stringify(result)});
+ }else throw Error('Operación desconocida');
+ try{localStorage.setItem(storageKey,JSON.stringify(workspace));}catch(error){throw Error('No se pudo guardar: el almacenamiento del navegador está lleno o no disponible. No se aplicó el cambio.');}
+ browserState=workspace;return {ok:true};
+}
+
 async function action(callback){try{document.querySelector('#notice').textContent='';await callback()}catch(error){document.querySelector('#notice').textContent=error.message}}
 async function refresh(){state=await api('state');document.querySelector('header span').textContent=state.demo?'LUMA GROUP':'LOCAL WORKSPACE';render()}
 
@@ -75,24 +168,19 @@ function exceptionTable(row,base){
 function latest(){return state.history.find(item=>item.id===selectedHistory)||state.history.at(-1)}
 function render(){document.querySelector('#nav').innerHTML=tabs.map(name=>`<button class="${tab===name?'active':''}" onclick="tab='${name}';render()">${name}</button>`).join('');const record=latest(),run=record?JSON.parse(record.data):null;let html='';
 if(tab==='Dashboard')html=dashboard(state.history.length?JSON.parse(state.history.at(-1).data):null);
-if(tab==='Imports'){html=`<h2>Imports</h2><div class="card"><p>CSV UTF-8 con importes con punto decimal. Saldos opuestos deben tener signos contrarios. El account debe ser la clave común de conciliación.</p><label>Empresa <select id="importCompany" required><option value="">Selecciona una empresa</option>${state.companies.map(company=>`<option value="${company.id}">${escapeHTML(company.name)}</option>`).join('')}</select></label>${state.companies.length?'':'<p>Primero añade tus empresas en Settings.</p>'}<label>Mapeo <select id="importMapping">${state.mappings.map(item=>`<option>${escapeHTML(item.name)}</option>`).join('')}</select></label><label>Archivo CSV <input id="file" type="file" accept=".csv"></label><button onclick="action(upload)" ${state.companies.length?'':'disabled'}>Importar</button></div><div class="card">${state.imports.map(item=>`<p>${escapeHTML(state.companies.find(company=>company.id===item.company_id)?.name||'Importación anterior sin empresa asignada')} · ${escapeHTML(item.name)} · ${JSON.parse(item.data).length} registros · ${escapeHTML(item.created)}</p>`).join('')||'No hay importaciones.'}</div>`}
-
+if(tab==='Imports'){html=`<h2>Imports</h2><p class="subtitle">Los archivos se procesan y guardan en este navegador. No se envían a un servidor. Borrar los datos del navegador elimina este espacio de trabajo.</p><div class="card"><p>CSV UTF-8 con importes con punto decimal. Saldos opuestos deben tener signos contrarios. El account debe ser la clave común de conciliación.</p><label>Empresa <select id="importCompany" required><option value="">Selecciona una empresa</option>${state.companies.map(company=>`<option value="${company.id}">${escapeHTML(company.name)}</option>`).join('')}</select></label>${state.companies.length?'':'<p>Primero añade tus empresas en Settings.</p>'}<label>Mapeo <select id="importMapping">${state.mappings.map(item=>`<option>${escapeHTML(item.name)}</option>`).join('')}</select></label><label>Archivo CSV <input id="file" type="file" accept=".csv"></label><button onclick="action(upload)" ${state.companies.length?'':'disabled'}>Importar</button></div>`}
+if(tab==='Imports')html+=reconciliationForm(run);
 if(tab==='Exceptions'){html=`<h2>Exceptions</h2><p class="subtitle">Diferencias que requieren tu atención · ${record?escapeHTML(record.created):'Sin ejecuciones'}</p><div style="height:24px"></div>`+(run?run.results.filter(row=>row.status==='Exception').map(row=>exceptionTable(row,run.options.base||'EUR')).join('')||'<div class="card">Sin excepciones.</div>':'<div class="card">Ejecuta una conciliación en Imports.</div>')}
 if(tab==='History'){html='<h2>History</h2>'+state.history.slice().reverse().map(item=>{const data=JSON.parse(item.data);return `<div class="card"><h3>${escapeHTML(item.created)}</h3><p>${data.rows} registros · ${escapeHTML(data.options.matching)} · ${escapeHTML(data.options.mode)} · ${data.results.filter(row=>row.status==='Matched').length} grupos conciliados</p><button onclick="selectedHistory='${item.id}';tab='Exceptions';render()">Ver excepciones</button> <button onclick="download('${item.id}')">Descargar CSV</button> <button onclick="download('${item.id}',true)">Detalle JSON</button></div>`}).join('')}
+if(tab==='History')html+=`<h3>Histórico de importaciones</h3><div class="card">${state.imports.map(item=>`<p>${escapeHTML(state.companies.find(company=>company.id===item.company_id)?.name||'Importación anterior sin empresa asignada')} · ${escapeHTML(item.name)} · ${JSON.parse(item.data).length} registros · ${escapeHTML(item.created)}</p>`).join('')||'No hay importaciones.'}</div>`;
 if(tab==='Mappings'){html='<h2>Mappings</h2><p>Seis mapeos globales de columnas. Los cambios se aplican a nuevas importaciones.</p><div class="grid">'+state.mappings.map((item,index)=>`<div class="card"><h3>${escapeHTML(item.name)}</h3><textarea id="mapping${index}" aria-label="${escapeHTML(item.name)}">${escapeHTML(JSON.stringify(JSON.parse(item.data),null,2))}</textarea><button onclick="action(()=>saveMapping(${index}))">Guardar</button></div>`).join('')+'</div>'}
 if(tab==='Settings'){html=`<h2>Settings</h2><div class="card"><h3>Empresas</h3><p>Estas empresas estarán disponibles en el listado de Imports.</p><ul>${state.companies.map(company=>`<li>${escapeHTML(company.name)}</li>`).join('')||'<li>No hay empresas configuradas.</li>'}</ul><label>Nombre de empresa <input id="newCompany" maxlength="200" placeholder="Nombre de la empresa"></label><button onclick="action(addCompany)">Añadir empresa</button><p id="companySaved" role="status"></p></div><div class="card"><h3>Monedas de trabajo</h3><label>Modalidad <select id="currencyMode" onchange="currencyFields()"><option ${state.settings.mode==='One Currency'?'selected':''}>One Currency</option><option ${state.settings.mode==='Multi Currency'?'selected':''}>Multi Currency</option></select></label><div id="currencyFields"></div><h3>Métodos de conversión</h3>${['Balance','P&L','Patrimonio'].map((category,index)=>`<label>${escapeHTML(category)} = Método <select data-conversion-method id="method${index}">${['Closing','Average','Historical'].map(method=>`<option ${state.settings.methods[category]===method?'selected':''}>${method}</option>`).join('')}</select></label>`).join('')}<label>Tolerancia <input id="tolerance" value="${escapeHTML(state.settings.tolerance)}" type="number" min="0" step="any" required></label><button onclick="action(saveSettings)">Guardar configuración</button><p id="settingsSaved" role="status"></p></div>`}
 document.querySelector('#main').innerHTML=html;
-if(tab==='Settings')currencyFields();
-if(tab==='Imports')document.querySelector('#main .card')?.remove();
-document.querySelectorAll('#main button[onclick]').forEach(button=>{
- if(/action\(/.test(button.getAttribute('onclick')))button.remove();
-});
-document.querySelectorAll('#main input,#main select,#main textarea').forEach(field=>field.disabled=true);
-}
+if(tab==='Settings')currencyFields()}
 function currencyFields(){const multi=document.querySelector('#currencyMode').value==='Multi Currency';document.querySelectorAll('[data-conversion-method]').forEach(select=>select.disabled=!multi);document.querySelector('#currencyFields').innerHTML=multi?`<label>Monedas (separadas por comas)<input id="currencies" value="${escapeHTML(state.settings.currencies.join(', '))}" placeholder="EUR, USD, GBP"></label><label>Moneda base para conciliación<input id="settingsBase" maxlength="3" value="${escapeHTML(state.settings.base)}"></label>`:`<label>Moneda<input id="settingsBase" maxlength="3" value="${escapeHTML(state.settings.base)}" placeholder="EUR"></label>`}
 async function saveSettings(){const mode=document.querySelector('#currencyMode').value;const base=document.querySelector('#settingsBase').value.trim().toUpperCase();const currencies=mode==='One Currency'?[base]:document.querySelector('#currencies').value.split(',').map(value=>value.trim().toUpperCase()).filter(Boolean);const methods=Object.fromEntries(['Balance','P&L','Patrimonio'].map((category,index)=>[category,document.querySelector('#method'+index).value]));const tolerance=document.querySelector('#tolerance').value;if(tolerance.trim()===''||!Number.isFinite(Number(tolerance))||Number(tolerance)<0)throw Error('Introduce una tolerancia igual o mayor que cero');await api('settings',{mode,base,currencies,methods,tolerance});await refresh();document.querySelector('#settingsSaved').textContent='Configuración guardada.'}
 async function addCompany(){const name=document.querySelector('#newCompany').value.trim();if(!name)throw Error('Introduce el nombre de la empresa');await api('company',{name});state=await api('state');const card=document.querySelector('#newCompany').closest('.card');card.querySelector('ul').innerHTML=state.companies.map(company=>`<li>${escapeHTML(company.name)}</li>`).join('');document.querySelector('#newCompany').value='';document.querySelector('#companySaved').textContent='Empresa añadida al listado.'}
-async function upload(){const company_id=document.querySelector('#importCompany').value;if(!company_id)throw Error('Selecciona una empresa del listado');const file=document.querySelector('#file').files[0];if(!file)throw Error('Selecciona un archivo');await api('import',{company_id,name:file.name,csv:await file.text(),mapping:document.querySelector('#importMapping').value});await refresh()}
+async function upload(){const company_id=document.querySelector('#importCompany').value;if(!company_id)throw Error('Selecciona una empresa del listado');const file=document.querySelector('#file').files[0];if(!file)throw Error('Selecciona un archivo');await api('import',{company_id,name:file.name,csv:await file.text(),mapping:document.querySelector('#importMapping').value});await refresh();document.querySelector('#notice').textContent='Archivo importado. Disponible para conciliar; registro guardado en History.'}
 async function saveMapping(index){const data=JSON.parse(document.querySelector('#mapping'+index).value);await api('mapping',{name:state.mappings[index].name,data});await refresh()}
 async function runReconciliation(){const options={};options.rates=JSON.parse(document.querySelector('#rates').value);await api('reconcile',{options,imports:[...document.querySelectorAll('[name=imports]:checked')].map(item=>item.value)});selectedHistory=null;tab='Exceptions';await refresh()}
 function download(id,json=false){const item=state.history.find(row=>row.id===id),data=JSON.parse(item.data);const fields=['pair','period','account','statement','reference','status','left_total','right_total','difference'];const quote=value=>'"'+String(value??'').replace(/"/g,'""')+'"';const content=json?JSON.stringify(data,null,2):[fields.join(','),...data.results.map(row=>fields.map(field=>quote(Array.isArray(row[field])?row[field].join(' / '):row[field])).join(','))].join('\r\n');const url=URL.createObjectURL(new Blob([content],{type:json?'application/json':'text/csv;charset=utf-8'}));const link=document.createElement('a');link.href=url;link.download='reconciliation-'+id+(json?'.json':'.csv');link.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}

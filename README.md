@@ -6,7 +6,7 @@ Aplicación local de conciliación intercompany con Python y SQLite.
 
 https://abarriosgranado.github.io/ic-reconciliation/
 
-La versión pública es de consulta y utiliza datos ficticios generados desde cero. Permite navegar por resultados y descargar el histórico. No permite importar ni modificar registros. La aplicación Python local conserva las funciones de edición.
+La versión pública inicia con datos ficticios y permite importar CSV, configurar empresas y mapeos, conciliar y descargar el histórico. Los cambios se procesan en el navegador y se guardan en su almacenamiento local: no se suben archivos a un servidor ni se comparten entre visitantes o dispositivos. Borrar los datos del navegador elimina los cambios. Imports contiene la carga y ejecución; History reúne conciliaciones e importaciones. Los archivos admitidos son CSV UTF-8, no Excel o PDF.
 
 Para actualizar la publicación: `python3 build_public.py`. GitHub Pages sirve la carpeta `docs` de la rama `main`.
 
@@ -37,6 +37,7 @@ Los métodos se desactivan con One Currency. Las importaciones CSV requieren imp
 
 ```sh
 python3 -m unittest -v
+node test_browser_store.cjs
 ```
 
 ## Alcance actual

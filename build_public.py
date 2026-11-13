@@ -22,20 +22,8 @@ with tempfile.TemporaryDirectory() as directory:
 html = (root / 'index.html').read_text()
 api_start = html.index('async function api(')
 api_end = html.index('\nasync function action(', api_start)
-html = html[:api_start] + '''async function api(path,data){
- if(data||path!=='state')throw Error('Esta versión pública es de consulta.');
- const response=await fetch('./state.json');
- if(!response.ok)throw Error('No se han podido cargar los datos. Recarga la página.');
- return response.json();
-}''' + html[api_end:]
-html = html.replace("if(tab==='Imports')html+=reconciliationForm(run);", '')
-html = html.replace("if(tab==='Settings')currencyFields()}", """if(tab==='Settings')currencyFields();
-if(tab==='Imports')document.querySelector('#main .card')?.remove();
-document.querySelectorAll('#main button[onclick]').forEach(button=>{
- if(/action\\(/.test(button.getAttribute('onclick')))button.remove();
-});
-document.querySelectorAll('#main input,#main select,#main textarea').forEach(field=>field.disabled=true);
-}""")
+html = html[:api_start] + (root / 'browser_store.js').read_text() + html[api_end:]
+html = html.replace('<h2>Imports</h2>', '<h2>Imports</h2><p class="subtitle">Los archivos se procesan y guardan en este navegador. No se envían a un servidor. Borrar los datos del navegador elimina este espacio de trabajo.</p>')
 html = html.replace('<title>IC Reconciliation</title>', '<title>IC Reconciliation | Intercompany workspace</title><meta name="description" content="Estado de conciliación intercompany, comparación entre empresas y análisis de diferencias.">')
 (output / 'index.html').write_text(html)
 (output / 'state.json').write_text(json.dumps(state, ensure_ascii=False))
